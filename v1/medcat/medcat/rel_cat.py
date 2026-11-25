@@ -327,7 +327,7 @@ class RelCAT(PipeRunner):
 
                 token_ids = token_ids.to(self.device)
                 labels = labels.to(self.device)
-                e1_e2_start = e1_e2_start.to(self.device)
+                # e1_e2_start = e1_e2_start.to(self.device)
 
                 model_output, classification_logits = self.component.model(
                     input_ids=token_ids,
@@ -460,7 +460,7 @@ class RelCAT(PipeRunner):
                     (token_ids.shape[0], token_ids.shape[1])).long().to(self.device)
 
                 token_ids = token_ids.to(self.device)
-                e1_e2_start = e1_e2_start.to(self.device)
+                # e1_e2_start = e1_e2_start.to(self.device)
                 labels = labels.to(self.device)
 
                 model_output, pred_classification_logits = self.component.model(
