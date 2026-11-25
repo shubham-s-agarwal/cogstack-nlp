@@ -111,6 +111,11 @@ class BaseModel_RelationExtraction(BaseModelBluePrint_RelationExtraction):
 
         self.drop_out = nn.Dropout(relcat_config.model.dropout)
         self.fc1, self.fc2, self.fc3 = create_dense_layers(relcat_config)
+        device = relcat_config.general.device
+        self.fc1.to(device)
+        self.fc2.to(device)
+        self.fc3.to(device)
+        self.drop_out.to(device)  # no params, harmless
 
         for param in self.hf_model.parameters(): # type: ignore
             if self.relcat_config.model.freeze_layers:
@@ -149,6 +154,7 @@ class BaseModel_RelationExtraction(BaseModelBluePrint_RelationExtraction):
         attention_mask = attention_mask.to(self.relcat_config.general.device)
         encoder_attention_mask = encoder_attention_mask.to(
             self.relcat_config.general.device)
+        token_type_ids = token_type_ids.to(self.relcat_config.general.device)  # <-- add this
 
         self.hf_model = self.hf_model.to(self.relcat_config.general.device) # type: ignore
 
@@ -215,6 +221,11 @@ class BaseModel_RelationExtraction(BaseModelBluePrint_RelationExtraction):
             del temp_e1
 
         x = self.drop_out(new_pooled_output)
+        device = self.relcat_config.general.device
+        self.fc1.to(device)
+        self.fc2.to(device)
+        self.fc3.to(device)
+        self.drop_out.to(device)  # no params, harmless
         x = self.fc1(x)
         x = self.drop_out(x)
         x = self.fc2(x)
