@@ -3,7 +3,6 @@ import logging
 import os
 import random
 import numpy
-from sklearn.utils import compute_class_weight
 import torch.optim
 import torch
 import torch.nn as nn
@@ -11,6 +10,8 @@ import spacy
 
 from tqdm import tqdm
 from datetime import date, datetime
+from sklearn.metrics import accuracy_score, classification_report
+from sklearn.utils import compute_class_weight
 from medcat.cdb import CDB
 from medcat.config import Config
 from medcat.config_rel_cat import ConfigRelCAT
@@ -24,6 +25,25 @@ from medcat.utils.relation_extraction.base_component import BaseComponent_Relati
 from medcat.utils.meta_cat.ml_utils import set_all_seeds
 from medcat.utils.relation_extraction.ml_utils import load_results, load_state, save_results, save_state, split_list_train_test_by_class
 from medcat.utils.relation_extraction.rel_dataset import RelData
+
+
+def resolve_device(requested: str) -> torch.device:
+    """Pick the best available device, honouring an explicit request where possible.
+
+    Supports cpu, cuda (incl. 'cuda:0') and mps (Apple Silicon). If the requested
+    accelerator isn't available, falls back to whatever is.
+    """
+    requested = (requested or "cpu").lower()
+    if requested.startswith("cpu"):
+        return torch.device("cpu")
+    mps_ok = hasattr(torch.backends, "mps") and torch.backends.mps.is_available()
+    if requested.startswith("mps") and mps_ok:
+        return torch.device("mps")
+    if torch.cuda.is_available():
+        return torch.device("cuda")
+    if mps_ok:
+        return torch.device("mps")
+    return torch.device("cpu")
 
 
 class BalancedBatchSampler(Sampler):
@@ -51,14 +71,13 @@ class BalancedBatchSampler(Sampler):
             while len(batch) < self.batch_size:
 
                 index = random.choice(indices)
-                label = self.dataset[index][2].numpy().tolist()[0]  # Assuming label is at index 1
+                label = self.dataset[index][2].numpy().tolist()[0]
                 if class_counts[label] < self.max_samples_per_class[label]:
                     batch.append(index)
                     class_counts[label] += 1
                     if self.max_samples_per_class[label] > self.max_minority:
                         indices.remove(index)
 
-                print("class_counts:", class_counts)
             yield batch
             batch_counter += 1
 
@@ -82,14 +101,13 @@ class RelCAT(PipeRunner):
 
     """
 
-
     name = "rel_cat"
 
     log = logging.getLogger(__name__)
 
     def __init__(self, cdb: CDB, config: ConfigRelCAT = ConfigRelCAT(), task="train", init_model=False):
 
-        self.component: BaseComponent_RelationExtraction = BaseComponent_RelationExtraction() # type: ignore
+        self.component: BaseComponent_RelationExtraction = BaseComponent_RelationExtraction()  # type: ignore
         self.task: str = task
         self.checkpoint_path: str = "./"
 
@@ -97,17 +115,19 @@ class RelCAT(PipeRunner):
 
         if init_model:
             self.component = BaseComponent_RelationExtraction(config=config,
-                                                                task=task,
-                                                                init_model=True)
+                                                              task=task,
+                                                              init_model=True)
 
         self.cdb = cdb
         logging.basicConfig(level=self.component.relcat_config.general.log_level)
         self.log.setLevel(self.component.relcat_config.general.log_level)
 
         self.is_cuda_available = torch.cuda.is_available()
-        self.device = torch.device(
-            "cuda" if self.is_cuda_available and self.component.relcat_config.general.device != "cpu" else "cpu")
+        self.device = resolve_device(self.component.relcat_config.general.device)
 
+    def _move_model_to_device(self) -> None:
+        """Moves the HF model AND every other submodule (fc1/fc2/fc3, dropout, ...) to self.device."""
+        self.component.model = self.component.model.to(self.device)  # type: ignore
 
     def save(self, save_path: str = "./") -> None:
         self.component.save(save_path=save_path)
@@ -124,7 +144,7 @@ class RelCAT(PipeRunner):
 
         component = BaseComponent_RelationExtraction.load(pretrained_model_name_or_path=load_path)
 
-        device = torch.device("cuda" if torch.cuda.is_available() and component.relcat_config.general.device != "cpu" else "cpu")
+        device = resolve_device(component.relcat_config.general.device)
 
         rel_cat = RelCAT(cdb=cdb, config=component.relcat_config, task=component.task)
         rel_cat.device = device
@@ -136,14 +156,16 @@ class RelCAT(PipeRunner):
         doc = next(self.pipe(iter([doc])))
         return doc
 
-    def _create_test_train_datasets(self, data: Dict, split_sets:bool = False):
+    def _create_test_train_datasets(self, data: Dict, split_sets: bool = False):
         train_data: Dict = {}
         test_data: Dict = {}
 
         if split_sets:
-            train_data["output_relations"], test_data["output_relations"] = split_list_train_test_by_class(data["output_relations"],
-                                                                                                test_size=self.component.relcat_config.train.test_size, shuffle=self.component.relcat_config.train.shuffle_data,
-                                                                                                sample_limit=self.component.relcat_config.general.limit_samples_per_class)
+            train_data["output_relations"], test_data["output_relations"] = split_list_train_test_by_class(
+                data["output_relations"],
+                test_size=self.component.relcat_config.train.test_size,
+                shuffle=self.component.relcat_config.train.shuffle_data,
+                sample_limit=self.component.relcat_config.general.limit_samples_per_class)
 
             test_data_label_names = [rec[4] for rec in test_data["output_relations"]]
 
@@ -171,13 +193,15 @@ class RelCAT(PipeRunner):
 
         return train_data, test_data
 
-    def train(self, export_data_path:str = "", train_csv_path:str = "", test_csv_path:str = "", checkpoint_path: str = "./"):
+    def train(self, export_data_path: str = "", train_csv_path: str = "", test_csv_path: str = "", checkpoint_path: str = "./"):
 
         if self.is_cuda_available:
             self.log.info("Training on device:" +
-                str(torch.cuda.get_device_name(0)) + str(self.device))
+                          str(torch.cuda.get_device_name(0)) + str(self.device))
+        else:
+            self.log.info("Training on device: " + str(self.device))
 
-        self.component.model = self.component.model.to(self.device)
+        self._move_model_to_device()
 
         # resize vocab just in case more tokens have been added
         self.component.model_config.vocab_size = self.component.tokenizer.get_size()
@@ -216,8 +240,8 @@ class RelCAT(PipeRunner):
                                            self.component.relcat_config.train['batching_samples_per_class'],
                                            self.component.relcat_config.train['batching_minority_limit'])
 
-            train_dataloader = DataLoader(train_rel_data,num_workers=0, collate_fn=self.component.padding_seq,
-                                          batch_sampler=sampler,pin_memory=self.component.relcat_config.general.pin_memory)
+            train_dataloader = DataLoader(train_rel_data, num_workers=0, collate_fn=self.component.padding_seq,
+                                          batch_sampler=sampler, pin_memory=self.component.relcat_config.general.pin_memory)
         else:
             train_dataloader = DataLoader(train_rel_data, batch_size=batch_size,
                                           shuffle=self.component.relcat_config.train.shuffle_data,
@@ -239,8 +263,8 @@ class RelCAT(PipeRunner):
         elif self.component.relcat_config.train.enable_class_weights:
             all_class_lbl_ids = [rec[5] for rec in train_rel_data.dataset["output_relations"]]
             self.component.relcat_config.train.class_weights = compute_class_weight(class_weight="balanced",
-                                                                   classes=numpy.unique(all_class_lbl_ids),
-                                                                   y=all_class_lbl_ids).tolist()
+                                                                                    classes=numpy.unique(all_class_lbl_ids),
+                                                                                    y=all_class_lbl_ids).tolist()
             criterion = nn.CrossEntropyLoss(weight=torch.FloatTensor(self.component.relcat_config.train.class_weights).to(self.device))
         else:
             criterion = nn.CrossEntropyLoss()
@@ -248,12 +272,12 @@ class RelCAT(PipeRunner):
         if self.component.optimizer is None:
             parameters = filter(lambda p: p.requires_grad, self.component.model.parameters())
             self.component.optimizer = AdamW(parameters, lr=self.component.relcat_config.train.lr, weight_decay=self.component.relcat_config.train.adam_weight_decay,
-                                betas=self.component.relcat_config.train.adam_betas, eps=self.component.relcat_config.train.adam_epsilon)
+                                             betas=self.component.relcat_config.train.adam_betas, eps=self.component.relcat_config.train.adam_epsilon)
 
         if self.component.scheduler is None:
             self.component.scheduler = MultiStepLR(
                 self.component.optimizer, milestones=self.component.relcat_config.train.multistep_milestones,
-                gamma=self.component.relcat_config.train.multistep_lr_gamma) # type: ignore
+                gamma=self.component.relcat_config.train.multistep_lr_gamma)  # type: ignore
 
         self.epoch, self.best_f1 = load_state(
             self.component.model, self.component.optimizer, self.component.scheduler, load_best=False, path=checkpoint_path, relcat_config=self.component.relcat_config)
@@ -270,7 +294,7 @@ class RelCAT(PipeRunner):
         self.component.relcat_config.general.labels2idx.update(train_rel_data.dataset["labels2idx"])
         self.component.relcat_config.general.idx2labels = {
             int(v): k for k, v in self.component.relcat_config.general["labels2idx"].items()}
-
+        print("Labels2idx:", self.component.relcat_config.general.idx2labels)
         gradient_acc_steps = self.component.relcat_config.train.gradient_acc_steps
         max_grad_norm = self.component.relcat_config.train.max_grad_norm
 
@@ -301,7 +325,9 @@ class RelCAT(PipeRunner):
                 token_type_ids = torch.zeros(
                     (token_ids.shape[0], token_ids.shape[1])).long().to(self.device)
 
+                token_ids = token_ids.to(self.device)
                 labels = labels.to(self.device)
+                e1_e2_start = e1_e2_start.to(self.device)
 
                 model_output, classification_logits = self.component.model(
                     input_ids=token_ids,
@@ -383,83 +409,34 @@ class RelCAT(PipeRunner):
                            model_name=self.component.relcat_config.general.model_name, task=self.task, is_checkpoint=True)
 
     def evaluate_(self, output_logits, labels, ignore_idx):
-        # ignore index (padding) when calculating accuracy
-        idxs = (labels != ignore_idx).squeeze()
-        labels_ = labels.squeeze()[idxs].to(self.device)
-        pred_labels = torch.softmax(output_logits, dim=1).max(1)[1]
-        pred_labels = pred_labels[idxs].to(self.device)
+        """Per-batch metrics via sklearn. Same return signature as before:
+        (acc, recall, precision, f1, pred_labels, true_labels, stat_per_label).
 
-        true_labels = labels_.cpu().numpy().tolist(
-        ) if labels_.is_cuda else labels_.numpy().tolist()
-        pred_labels = pred_labels.cpu().numpy().tolist(
-        ) if pred_labels.is_cuda else pred_labels.numpy().tolist()
+        The recall/precision/f1 returned here are weighted averages (weighted by class support).
+        Per-batch values on small batches are noisy; use evaluate_results for trustworthy numbers.
+        """
+        # ignore index (padding) when calculating metrics
+        idxs = (labels != ignore_idx).view(-1).to(output_logits.device)
+        true_labels = labels.view(-1).to(output_logits.device)[idxs].cpu().tolist()
+        pred_labels = torch.softmax(output_logits, dim=1).max(1)[1][idxs].cpu().tolist()
 
-        unique_labels = set(true_labels)
+        if len(true_labels) == 0:
+            return 0.0, 0.0, 0.0, 0.0, pred_labels, true_labels, {}
 
-        batch_size = len(true_labels)
+        report = classification_report(true_labels, pred_labels,
+                                       output_dict=True, zero_division=0)
 
-        stat_per_label = dict()
+        skip = ("accuracy", "micro avg", "macro avg", "weighted avg")
+        stat_per_label = {
+            int(k): {"f1": v["f1-score"], "prec": v["precision"],
+                     "recall": v["recall"], "support": v["support"]}
+            for k, v in report.items() if k not in skip
+        }
 
-        total_tp, total_fp, total_tn, total_fn = 0, 0, 0, 0
-        acc, micro_recall, micro_precision, micro_f1 = 0, 0, 0, 0
+        acc = accuracy_score(true_labels, pred_labels)
+        w = report["weighted avg"]
 
-        for label in unique_labels:
-            stat_per_label[label] = {
-                "tp": 0, "fp": 0, "tn": 0, "fn": 0, "f1": 0.0, "acc": 0.0, "prec": 0.0, "recall": 0.0}
-
-            for true_label_idx in range(len(true_labels)):
-                if true_labels[true_label_idx] == label:
-                    if pred_labels[true_label_idx] == label:
-                        stat_per_label[label]["tp"] += 1
-                        total_tp += 1
-                    if pred_labels[true_label_idx] != label:
-                        stat_per_label[label]["fp"] += 1
-                        total_fp += 1
-                elif true_labels[true_label_idx] != label and label == pred_labels[true_label_idx]:
-                    stat_per_label[label]["fn"] += 1
-                    total_fn += 1
-                else:
-                    stat_per_label[label]["tn"] += 1
-                    total_tn += 1
-
-            lbl_tp_tn = stat_per_label[label]["tn"] + \
-                stat_per_label[label]["tp"]
-
-            lbl_tp_fn = stat_per_label[label]["fn"] + \
-                stat_per_label[label]["tp"]
-            lbl_tp_fn = lbl_tp_fn if lbl_tp_fn > 0.0 else 1.0
-
-            lbl_tp_fp = stat_per_label[label]["tp"] + \
-                stat_per_label[label]["fp"]
-            lbl_tp_fp = lbl_tp_fp if lbl_tp_fp > 0.0 else 1.0
-
-            stat_per_label[label]["acc"] = lbl_tp_tn / batch_size
-            stat_per_label[label]["prec"] = stat_per_label[label]["tp"] / lbl_tp_fp
-            stat_per_label[label]["recall"] = stat_per_label[label]["tp"] / lbl_tp_fn
-
-            lbl_re_pr = stat_per_label[label]["recall"] + \
-                stat_per_label[label]["prec"]
-            lbl_re_pr = lbl_re_pr if lbl_re_pr > 0.0 else 1.0
-
-            stat_per_label[label]["f1"] = (
-                2 * (stat_per_label[label]["recall"] * stat_per_label[label]["prec"])) / lbl_re_pr
-
-        tp_fn = total_fn + total_tp
-        tp_fn = tp_fn if tp_fn > 0.0 else 1.0
-
-        tp_fp = total_fp + total_tp
-        tp_fp = tp_fp if tp_fp > 0.0 else 1.0
-
-        micro_recall = total_tp / tp_fn
-        micro_precision = total_tp / tp_fp
-
-        re_pr = micro_recall + micro_precision
-        re_pr = re_pr if re_pr > 0.0 else 1.0
-        micro_f1 = (2 * (micro_recall * micro_precision)) / re_pr
-
-        acc = total_tp / batch_size
-
-        return acc, micro_recall, micro_precision, micro_f1, pred_labels, true_labels, stat_per_label
+        return acc, w["recall"], w["precision"], w["f1-score"], pred_labels, true_labels, stat_per_label
 
     def evaluate_results(self, data_loader, pad_id):
         self.log.info("Evaluating test samples...")
@@ -468,8 +445,10 @@ class RelCAT(PipeRunner):
         else:
             criterion = nn.CrossEntropyLoss()
 
-        total_loss, total_acc, total_f1, total_recall, total_precision = 0.0, 0.0, 0.0, 0.0, 0.0
-        all_batch_stats_per_label = []
+        total_loss = 0.0
+        num_batches = 0
+        all_true: List[int] = []
+        all_pred: List[int] = []
 
         self.component.model.eval()
 
@@ -480,70 +459,63 @@ class RelCAT(PipeRunner):
                 token_type_ids = torch.zeros(
                     (token_ids.shape[0], token_ids.shape[1])).long().to(self.device)
 
+                token_ids = token_ids.to(self.device)
+                e1_e2_start = e1_e2_start.to(self.device)
                 labels = labels.to(self.device)
 
-                model_output, pred_classification_logits = self.component.model(token_ids, token_type_ids=token_type_ids,
-                                                                      attention_mask=attention_mask, Q=None,
-                                                                      e1_e2_start=e1_e2_start)
+                model_output, pred_classification_logits = self.component.model(
+                    token_ids, token_type_ids=token_type_ids,
+                    attention_mask=attention_mask, Q=None,
+                    e1_e2_start=e1_e2_start)
+
+                pred_classification_logits = pred_classification_logits.to(self.device)
 
                 batch_loss = criterion(pred_classification_logits.view(
-                    -1, self.component.relcat_config.train.nclasses).to(self.device), labels.squeeze(1))
+                    -1, self.component.relcat_config.train.nclasses), labels.squeeze(1))
                 total_loss += batch_loss.item()
+                num_batches += 1
 
-                batch_accuracy, batch_recall, batch_precision, batch_f1, pred_labels, true_labels, batch_stats_per_label = \
-                    self.evaluate_(pred_classification_logits,
-                                   labels, ignore_idx=-1)
+                # collect predictions over the whole loader; metrics are computed once at the end
+                labels_flat = labels.view(-1)
+                keep = labels_flat != -1
+                all_true.extend(labels_flat[keep].cpu().tolist())
+                all_pred.extend(pred_classification_logits.argmax(dim=1)[keep].cpu().tolist())
 
-                all_batch_stats_per_label.append(batch_stats_per_label)
+        idx2labels = self.component.relcat_config.general.idx2labels
 
-                total_acc += batch_accuracy
-                total_recall += batch_recall
-                total_precision += batch_precision
-                total_f1 += batch_f1
+        # only score classes that actually occur (in truth or prediction), so absent classes
+        # don't drag the macro average down with 0 scores
+        label_ids = sorted(set(all_true) | set(all_pred))
+        target_names = [str(idx2labels.get(i, i)) for i in label_ids]
 
-        final_stats_per_label = {}
-
-        for batch_label_stats in all_batch_stats_per_label:
-            for label_id, stat_dict in batch_label_stats.items():
-
-                if label_id not in final_stats_per_label.keys():
-                    final_stats_per_label[label_id] = stat_dict
-                else:
-                    for stat, score in stat_dict.items():
-                        final_stats_per_label[label_id][stat] += score
-
-        for label_id, stat_dict in final_stats_per_label.items():
-            for stat_name, value in stat_dict.items():
-                final_stats_per_label[label_id][stat_name] = value / (i + 1)
-
-        total_loss = total_loss / (i + 1)
-        total_acc = total_acc / (i + 1)
-        total_precision = total_precision / (i + 1)
-        total_f1 = total_f1 / (i + 1)
-        total_recall = total_recall / (i + 1)
+        if len(all_true) > 0:
+            report = classification_report(
+                all_true, all_pred, labels=label_ids, target_names=target_names,
+                output_dict=True, zero_division=0)
+            report_text = classification_report(
+                all_true, all_pred, labels=label_ids, target_names=target_names,
+                zero_division=0)
+            accuracy = report["accuracy"]
+            macro = report["macro avg"]
+        else:
+            report_text = "(no labelled samples)"
+            accuracy = 0.0
+            macro = {"precision": 0.0, "recall": 0.0, "f1-score": 0.0}
 
         results = {
-            "loss": total_loss,
-            "accuracy": total_acc,
-            "precision": total_precision,
-            "recall": total_recall,
-            "f1": total_f1
+            "loss": total_loss / max(num_batches, 1),
+            "accuracy": accuracy,
+            "precision": macro["precision"],   # macro averages
+            "recall": macro["recall"],
+            "f1": macro["f1-score"],           # macro F1 drives best-model selection
         }
 
         self.log.info("==================== Evaluation Results ===================")
-        self.log.info(" no. of batches:" + str(i + 1))
+        self.log.info(" no. of batches:" + str(num_batches))
         for key in sorted(results.keys()):
             self.log.info(" %s = %0.3f" % (key, results[key]))
         self.log.info("----------------------- class stats -----------------------")
-        for label_id, stat_dict in final_stats_per_label.items():
-            self.log.info("label: %s | f1: %0.3f | prec : %0.3f | acc: %0.3f | recall: %0.3f " % (
-                self.component.relcat_config.general.idx2labels[label_id],
-                stat_dict["f1"],
-                stat_dict["prec"],
-                stat_dict["acc"],
-                stat_dict["recall"]
-            ))
-        self.log.info("-----------------------------------------------------------")
+        self.log.info("\n" + report_text)
         self.log.info("===========================================================")
 
         return results
@@ -553,7 +525,8 @@ class RelCAT(PipeRunner):
         predict_rel_dataset = RelData(
             cdb=self.cdb, config=self.component.relcat_config, tokenizer=self.component.tokenizer)
 
-        self.component.model = self.component.model.to(self.device)  # type: ignore
+        self._move_model_to_device()
+        self.component.model.eval()
 
         for doc_id, doc in enumerate(stream, 0):
             predict_rel_dataset.dataset, _ = self._create_test_train_datasets(
@@ -573,7 +546,7 @@ class RelCAT(PipeRunner):
 
             pbar = tqdm(total=total_rel_found)
 
-            for i, data in enumerate(predict_dataloader):
+            for data in predict_dataloader:
                 with torch.no_grad():
                     token_ids, e1_e2_start, labels, _, _ = data
 
@@ -581,34 +554,31 @@ class RelCAT(PipeRunner):
                     token_type_ids = torch.zeros(
                         token_ids.shape[0], token_ids.shape[1]).long().to(self.device)
 
+                    token_ids = token_ids.to(self.device)
+                    e1_e2_start = e1_e2_start.to(self.device)
+
                     model_output, pred_classification_logits = self.component.model(
                         token_ids, token_type_ids=token_type_ids, attention_mask=attention_mask,
                         e1_e2_start=e1_e2_start)  # type: ignore
 
-                    for i, pred_rel_logits in enumerate(pred_classification_logits):
+                    for pred_rel_logits in pred_classification_logits:
                         rel_idx += 1
 
                         confidence = torch.softmax(
                             pred_rel_logits, dim=0).max(0)
                         predicted_label_id = int(confidence[1].item())
 
-
-
                         doc._.relations.append({"relation": self.component.relcat_config.general.idx2labels[predicted_label_id],
                                                 "label_id": predicted_label_id,
-                                                "ent1_text": predict_rel_dataset.dataset["output_relations"][rel_idx][
-                                                    2],
-                                                "ent2_text": predict_rel_dataset.dataset["output_relations"][rel_idx][
-                                                    3],
-                                                "confidence": float("{:.3f}".format(confidence[0])),
+                                                "ent1_text": predict_rel_dataset.dataset["output_relations"][rel_idx][2],
+                                                "ent2_text": predict_rel_dataset.dataset["output_relations"][rel_idx][3],
+                                                "confidence": float("{:.3f}".format(confidence[0].item())),
                                                 "start_ent1_char_pos": predict_rel_dataset.dataset["output_relations"][rel_idx][18],
                                                 "end_ent1_char_pos": predict_rel_dataset.dataset["output_relations"][rel_idx][19],
                                                 "start_ent2_char_pos": predict_rel_dataset.dataset["output_relations"][rel_idx][20],
                                                 "end_ent2_char_pos": predict_rel_dataset.dataset["output_relations"][rel_idx][21],
-                                                "start_entity_id":
-                                                    predict_rel_dataset.dataset["output_relations"][rel_idx][8],
-                                                "end_entity_id":
-                                                    predict_rel_dataset.dataset["output_relations"][rel_idx][9]})
+                                                "start_entity_id": predict_rel_dataset.dataset["output_relations"][rel_idx][8],
+                                                "end_entity_id": predict_rel_dataset.dataset["output_relations"][rel_idx][9]})
                     pbar.update(len(token_ids))
             pbar.close()
 
@@ -621,7 +591,7 @@ class RelCAT(PipeRunner):
             text (str): text
             annotations (Dict): dict containing the entities from NER (of your choosing), the format
                 must be the following format:
-                        [ 
+                        [
                             {
                                 "cui": "202099003", -this is optional
                                 "value": "discoid lateral meniscus",
@@ -659,7 +629,7 @@ class RelCAT(PipeRunner):
             entity = Span(doc, min(tkn_idx), max(tkn_idx) + 1, label=ann["value"])
             entity._.cui = ann["cui"]
             entity._.start = ann["start"]
-            entity._.end = ann["end"]            
+            entity._.end = ann["end"]
             doc._.ents.append(entity)
 
         doc = self(doc)
