@@ -401,7 +401,7 @@ class RelCAT(PipeRunner):
                 self.best_f1 = f1_per_epoch[-1]
                 save_state(self.component.model, self.component.optimizer, self.component.scheduler, self.epoch, self.best_f1, checkpoint_path,
                            model_name=self.component.relcat_config.general.model_name, task=self.task, is_checkpoint=False)
-
+                self.log.info("######################### Model saved to disk ##############")
             if (epoch % 1) == 0:
                 save_results({"losses_per_epoch": losses_per_epoch, "accuracy_per_epoch": accuracy_per_epoch,
                               "f1_per_epoch": f1_per_epoch, "epoch": epoch}, file_prefix="train", path=checkpoint_path)
