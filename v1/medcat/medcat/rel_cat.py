@@ -7,7 +7,7 @@ import torch.optim
 import torch
 import torch.nn as nn
 import spacy
-
+import time  # add to your imports (replaces the datetime timing)
 from tqdm import tqdm
 from datetime import date, datetime
 from sklearn.metrics import accuracy_score, classification_report
@@ -193,7 +193,8 @@ class RelCAT(PipeRunner):
 
         return train_data, test_data
 
-    def train(self, export_data_path: str = "", train_csv_path: str = "", test_csv_path: str = "", checkpoint_path: str = "./"):
+    def train(self, export_data_path: str = "", train_csv_path: str = "", test_csv_path: str = "",
+              checkpoint_path: str = "./"):
 
         if self.is_cuda_available:
             self.log.info("Training on device:" +
@@ -206,11 +207,12 @@ class RelCAT(PipeRunner):
         # resize vocab just in case more tokens have been added
         self.component.model_config.vocab_size = self.component.tokenizer.get_size()
 
-        train_rel_data = RelData(
-            cdb=self.cdb, config=self.component.relcat_config, tokenizer=self.component.tokenizer)
-        test_rel_data = RelData(
-            cdb=self.cdb, config=self.component.relcat_config, tokenizer=self.component.tokenizer)
+        cfg = self.component.relcat_config
 
+        train_rel_data = RelData(cdb=self.cdb, config=cfg, tokenizer=self.component.tokenizer)
+        test_rel_data = RelData(cdb=self.cdb, config=cfg, tokenizer=self.component.tokenizer)
+
+        # ------------------------------------------------------------------ data
         if train_csv_path != "":
             if test_csv_path != "":
                 train_rel_data.dataset, _ = self._create_test_train_datasets(
@@ -220,9 +222,7 @@ class RelCAT(PipeRunner):
             else:
                 train_rel_data.dataset, test_rel_data.dataset = self._create_test_train_datasets(
                     train_rel_data.create_base_relations_from_csv(train_csv_path), split_sets=True)
-
         elif export_data_path != "":
-            export_data = {}
             with open(export_data_path) as f:
                 export_data = json.load(f)
             train_rel_data.dataset, test_rel_data.dataset = self._create_test_train_datasets(
@@ -230,106 +230,123 @@ class RelCAT(PipeRunner):
         else:
             raise ValueError("NO DATA HAS BEEN PROVIDED (MedCAT Trainer export JSON/CSV/spacy_DOCS)")
 
-        train_dataset_size = len(train_rel_data)
-        batch_size = train_dataset_size if train_dataset_size < self.component.relcat_config.train.batch_size else self.component.relcat_config.train.batch_size
+        # ------------------------------------- class count / label maps (before
+        # the sampler, criterion and training loop use them)
+        if train_rel_data.dataset["nclasses"] > cfg.train.nclasses:
+            cfg.train.nclasses = train_rel_data.dataset["nclasses"]
+            self.component.model.relcat_config.train.nclasses = cfg.train.nclasses
 
-        # to use stratified batching
-        if self.component.relcat_config.train['stratified_batching']:
-            sampler = BalancedBatchSampler(train_rel_data, [i for i in range(self.component.relcat_config.train.nclasses)],
+        cfg.general.labels2idx.update(train_rel_data.dataset["labels2idx"])
+        cfg.general.idx2labels = {int(v): k for k, v in cfg.general["labels2idx"].items()}
+        print("Labels2idx:", cfg.general.idx2labels)
+
+        nclasses = cfg.train.nclasses
+
+        # ----------------------------------------------------------- dataloaders
+        train_dataset_size = len(train_rel_data)
+        batch_size = min(train_dataset_size, cfg.train.batch_size)
+
+        if cfg.train['stratified_batching']:
+            sampler = BalancedBatchSampler(train_rel_data, [i for i in range(nclasses)],
                                            batch_size,
-                                           self.component.relcat_config.train['batching_samples_per_class'],
-                                           self.component.relcat_config.train['batching_minority_limit'])
+                                           cfg.train['batching_samples_per_class'],
+                                           cfg.train['batching_minority_limit'])
 
             train_dataloader = DataLoader(train_rel_data, num_workers=0, collate_fn=self.component.padding_seq,
-                                          batch_sampler=sampler, pin_memory=self.component.relcat_config.general.pin_memory)
+                                          batch_sampler=sampler, pin_memory=cfg.general.pin_memory)
         else:
             train_dataloader = DataLoader(train_rel_data, batch_size=batch_size,
-                                          shuffle=self.component.relcat_config.train.shuffle_data,
+                                          shuffle=cfg.train.shuffle_data,
                                           num_workers=0,
                                           collate_fn=self.component.padding_seq,
-                                          pin_memory=self.component.relcat_config.general.pin_memory)
+                                          pin_memory=cfg.general.pin_memory)
 
         test_dataset_size = len(test_rel_data)
-        test_batch_size = test_dataset_size if test_dataset_size < self.component.relcat_config.train.batch_size else self.component.relcat_config.train.batch_size
+        test_batch_size = min(test_dataset_size, cfg.train.batch_size)
         test_dataloader = DataLoader(test_rel_data,
                                      batch_size=test_batch_size,
-                                     shuffle=self.component.relcat_config.train.shuffle_data,
+                                     shuffle=cfg.train.shuffle_data,
                                      num_workers=0,
                                      collate_fn=self.component.padding_seq,
-                                     pin_memory=self.component.relcat_config.general.pin_memory)
+                                     pin_memory=cfg.general.pin_memory)
 
-        if self.component.relcat_config.train.class_weights is not None and self.component.relcat_config.train.enable_class_weights:
-            criterion = nn.CrossEntropyLoss(weight=torch.FloatTensor(numpy.asarray(self.component.relcat_config.train.class_weights)).to(self.device))
-        elif self.component.relcat_config.train.enable_class_weights:
+        # ------------------------------------------------------------- criterion
+        if cfg.train.class_weights is not None and cfg.train.enable_class_weights:
+            criterion = nn.CrossEntropyLoss(
+                weight=torch.FloatTensor(numpy.asarray(cfg.train.class_weights)).to(self.device))
+        elif cfg.train.enable_class_weights:
             all_class_lbl_ids = [rec[5] for rec in train_rel_data.dataset["output_relations"]]
-            self.component.relcat_config.train.class_weights = compute_class_weight(class_weight="balanced",
-                                                                                    classes=numpy.unique(all_class_lbl_ids),
-                                                                                    y=all_class_lbl_ids).tolist()
-            criterion = nn.CrossEntropyLoss(weight=torch.FloatTensor(self.component.relcat_config.train.class_weights).to(self.device))
+            present = numpy.unique(all_class_lbl_ids)
+            present_weights = compute_class_weight(class_weight="balanced",
+                                                   classes=present,
+                                                   y=all_class_lbl_ids)
+            # full-length vector so classes absent from the train split don't
+            # shorten/misalign the weights
+            full_weights = numpy.ones(nclasses, dtype=numpy.float64)
+            full_weights[present.astype(int)] = present_weights
+            cfg.train.class_weights = full_weights.tolist()
+            criterion = nn.CrossEntropyLoss(
+                weight=torch.FloatTensor(cfg.train.class_weights).to(self.device))
         else:
             criterion = nn.CrossEntropyLoss()
 
+        # ------------------------------------------------- optimizer / scheduler
         if self.component.optimizer is None:
             parameters = filter(lambda p: p.requires_grad, self.component.model.parameters())
-            self.component.optimizer = AdamW(parameters, lr=self.component.relcat_config.train.lr, weight_decay=self.component.relcat_config.train.adam_weight_decay,
-                                             betas=self.component.relcat_config.train.adam_betas, eps=self.component.relcat_config.train.adam_epsilon)
+            self.component.optimizer = AdamW(parameters, lr=cfg.train.lr,
+                                             weight_decay=cfg.train.adam_weight_decay,
+                                             betas=cfg.train.adam_betas,
+                                             eps=cfg.train.adam_epsilon)
 
         if self.component.scheduler is None:
             self.component.scheduler = MultiStepLR(
-                self.component.optimizer, milestones=self.component.relcat_config.train.multistep_milestones,
-                gamma=self.component.relcat_config.train.multistep_lr_gamma)  # type: ignore
+                self.component.optimizer, milestones=cfg.train.multistep_milestones,
+                gamma=cfg.train.multistep_lr_gamma)  # type: ignore
 
-        self.epoch, self.best_f1 = load_state(
-            self.component.model, self.component.optimizer, self.component.scheduler, load_best=False, path=checkpoint_path, relcat_config=self.component.relcat_config)
+        # Load model/optimizer/scheduler state (and best_f1) from the checkpoint,
+        # but do NOT continue the epoch count: always start from epoch 0.
+        _, self.best_f1 = load_state(
+            self.component.model, self.component.optimizer, self.component.scheduler,
+            load_best=False, path=checkpoint_path, relcat_config=cfg)
+        self.epoch = 0
 
         self.log.info("Starting training process...")
 
-        losses_per_epoch, accuracy_per_epoch, f1_per_epoch = load_results(
-            path=checkpoint_path)
+        losses_per_epoch, accuracy_per_epoch, f1_per_epoch = load_results(path=checkpoint_path)
 
-        if train_rel_data.dataset["nclasses"] > self.component.relcat_config.train.nclasses:
-            self.component.relcat_config.train.nclasses = train_rel_data.dataset["nclasses"]
-            self.component.model.relcat_config.train.nclasses = self.component.relcat_config.train.nclasses
+        gradient_acc_steps = max(1, cfg.train.gradient_acc_steps)
+        max_grad_norm = cfg.train.max_grad_norm
+        n_epochs = cfg.train.nepochs
+        n_batches = len(train_dataloader)
+        log_every = max(1, n_batches // 10)
 
-        self.component.relcat_config.general.labels2idx.update(train_rel_data.dataset["labels2idx"])
-        self.component.relcat_config.general.idx2labels = {
-            int(v): k for k, v in self.component.relcat_config.general["labels2idx"].items()}
-        print("Labels2idx:", self.component.relcat_config.general.idx2labels)
-        gradient_acc_steps = self.component.relcat_config.train.gradient_acc_steps
-        max_grad_norm = self.component.relcat_config.train.max_grad_norm
+        optimizer = self.component.optimizer
+        optimizer.zero_grad()
 
-        _epochs = self.epoch + self.component.relcat_config.train.nepochs
-
-        for epoch in range(0, _epochs):
-            start_time = datetime.now().time()
-            total_loss = 0.0
+        # ------------------------------------------------------------------ loop
+        for epoch in range(n_epochs):
+            start_time = time.perf_counter()
 
             loss_per_batch = []
             accuracy_per_batch = []
 
-            self.log.info(
-                "Total epochs on this model: %d | currently training epoch %d" % (_epochs, epoch))
+            self.log.info("Currently training epoch %d of %d" % (epoch + 1, n_epochs))
 
+            self.component.model.train()
             pbar = tqdm(total=train_dataset_size)
 
-            for i, data in enumerate(train_dataloader, 0):
-                self.component.model.train()
-                self.component.model.zero_grad()
-
+            for i, data in enumerate(train_dataloader):
                 current_batch_size = len(data[0])
                 token_ids, e1_e2_start, labels, _, _ = data
 
-                attention_mask = (
-                    token_ids != self.component.pad_id).float().to(self.device)
-
+                attention_mask = (token_ids != self.component.pad_id).float().to(self.device)
                 token_type_ids = torch.zeros(
                     (token_ids.shape[0], token_ids.shape[1])).long().to(self.device)
 
                 token_ids = token_ids.to(self.device)
                 labels = labels.to(self.device)
-                # e1_e2_start = e1_e2_start.to(self.device)
 
-                model_output, classification_logits = self.component.model(
+                _, classification_logits = self.component.model(
                     input_ids=token_ids,
                     token_type_ids=token_type_ids,
                     attention_mask=attention_mask,
@@ -337,76 +354,76 @@ class RelCAT(PipeRunner):
                 )
 
                 batch_loss = criterion(
-                    classification_logits.view(-1, self.component.relcat_config.train.nclasses).to(self.device), labels.squeeze(1))
+                    classification_logits.view(-1, nclasses).to(self.device), labels.squeeze(1))
 
-                batch_loss.backward()
-                batch_loss = batch_loss / gradient_acc_steps
+                # size of the accumulation window this batch belongs to (the last
+                # window of an epoch may be shorter than gradient_acc_steps)
+                window_start = (i // gradient_acc_steps) * gradient_acc_steps
+                window_len = min(gradient_acc_steps, n_batches - window_start)
 
-                total_loss += batch_loss.item() / current_batch_size
+                # scale so accumulated gradients equal the mean over the window
+                (batch_loss / window_len).backward()
 
                 batch_acc, _, batch_precision, batch_f1, _, _, batch_stats_per_label = self.evaluate_(
                     classification_logits, labels, ignore_idx=-1)
 
-                loss_per_batch.append(batch_loss / current_batch_size)
+                loss_per_batch.append(batch_loss.item())
                 accuracy_per_batch.append(batch_acc)
 
-                torch.nn.utils.clip_grad_norm_(
-                    self.component.model.parameters(), max_grad_norm)
+                # step at the end of each accumulation window, including the last
+                # (possibly partial) window of the epoch
+                if ((i + 1) % gradient_acc_steps == 0) or ((i + 1) == n_batches):
+                    torch.nn.utils.clip_grad_norm_(self.component.model.parameters(), max_grad_norm)
+                    optimizer.step()
+                    optimizer.zero_grad()
 
-                if (i % gradient_acc_steps) == 0:
-                    self.component.optimizer.step()
-                    self.component.scheduler.step()
-                if ((i + 1) % current_batch_size == 0):
+                if (i + 1) % log_every == 0:
                     self.log.debug(
-                        "[Epoch: %d, loss per batch, accuracy per batch: %.3f, %.3f, average total loss %.3f , total loss %.3f]" %
-                        (epoch, loss_per_batch[-1], accuracy_per_batch[-1], total_loss / (i + 1), total_loss))
+                        "[Epoch: %d, batch %d/%d, loss: %.3f, accuracy: %.3f, running mean loss: %.3f]" %
+                        (epoch, i + 1, n_batches, loss_per_batch[-1], accuracy_per_batch[-1],
+                         sum(loss_per_batch) / len(loss_per_batch)))
 
                 pbar.update(current_batch_size)
 
             pbar.close()
 
+            # MultiStepLR milestones are interpreted as epochs here
+            self.component.scheduler.step()
+
             if len(loss_per_batch) > 0:
-                losses_per_epoch.append(
-                    sum(loss_per_batch) / len(loss_per_batch))
-                self.log.info("Losses at Epoch %d: %.5f" %
-                              (epoch, losses_per_epoch[-1]))
+                losses_per_epoch.append(sum(loss_per_batch) / len(loss_per_batch))
+                self.log.info("Losses at Epoch %d: %.5f" % (epoch, losses_per_epoch[-1]))
 
             if len(accuracy_per_batch) > 0:
-                accuracy_per_epoch.append(
-                    sum(accuracy_per_batch) / len(accuracy_per_batch))
-                self.log.info("Train accuracy at Epoch %d: %.5f" %
-                              (epoch, accuracy_per_epoch[-1]))
+                accuracy_per_epoch.append(sum(accuracy_per_batch) / len(accuracy_per_batch))
+                self.log.info("Train accuracy at Epoch %d: %.5f" % (epoch, accuracy_per_epoch[-1]))
 
-            total_loss = total_loss / (i + 1)
-
-            end_time = datetime.now().time()
-
-            self.log.info(
-                "======================== TRAIN SET TEST RESULTS ========================")
+            self.log.info("======================== TRAIN SET TEST RESULTS ========================")
             _ = self.evaluate_results(train_dataloader, self.component.pad_id)
 
-            self.log.info(
-                "======================== TEST SET TEST RESULTS ========================")
+            self.log.info("======================== TEST SET TEST RESULTS ========================")
             results = self.evaluate_results(test_dataloader, self.component.pad_id)
 
             f1_per_epoch.append(results['f1'])
 
-            self.log.info("Epoch finished, took " + str(datetime.combine(date.today(),
-                                                                         end_time) - datetime.combine(date.today(),
-                                                                                                      start_time)) + " seconds")
+            self.log.info("Epoch finished, took %.1f seconds" % (time.perf_counter() - start_time))
 
             self.epoch += 1
 
-            if len(f1_per_epoch) > 0 and f1_per_epoch[-1] > self.best_f1:
+            if f1_per_epoch[-1] > self.best_f1:
                 self.best_f1 = f1_per_epoch[-1]
-                save_state(self.component.model, self.component.optimizer, self.component.scheduler, self.epoch, self.best_f1, checkpoint_path,
-                           model_name=self.component.relcat_config.general.model_name, task=self.task, is_checkpoint=False)
+                save_state(self.component.model, self.component.optimizer, self.component.scheduler,
+                           self.epoch, self.best_f1, checkpoint_path,
+                           model_name=cfg.general.model_name, task=self.task, is_checkpoint=False)
                 self.log.info("######################### Model saved to disk ##############")
-            if (epoch % 1) == 0:
-                save_results({"losses_per_epoch": losses_per_epoch, "accuracy_per_epoch": accuracy_per_epoch,
-                              "f1_per_epoch": f1_per_epoch, "epoch": epoch}, file_prefix="train", path=checkpoint_path)
-                save_state(self.component.model, self.component.optimizer, self.component.scheduler, self.epoch, self.best_f1, checkpoint_path,
-                           model_name=self.component.relcat_config.general.model_name, task=self.task, is_checkpoint=True)
+
+            save_results({"losses_per_epoch": losses_per_epoch, "accuracy_per_epoch": accuracy_per_epoch,
+                          "f1_per_epoch": f1_per_epoch, "epoch": epoch},
+                         file_prefix="train", path=checkpoint_path)
+            save_state(self.component.model, self.component.optimizer, self.component.scheduler,
+                       self.epoch, self.best_f1, checkpoint_path,
+                       model_name=cfg.general.model_name, task=self.task, is_checkpoint=True)
+
 
     def evaluate_(self, output_logits, labels, ignore_idx):
         """Per-batch metrics via sklearn. Same return signature as before:
