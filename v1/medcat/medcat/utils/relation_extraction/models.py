@@ -92,9 +92,9 @@ class BaseModel_RelationExtraction(BaseModelBluePrint_RelationExtraction):
     name = "basemodel_relcat"
     log = logging.getLogger(__name__)
 
-    def __init__(self, relcat_config: ConfigRelCAT, config: ConfigRelCAT,
+    def __init__(self, relcat_config: ConfigRelCAT,
                  model_config: BaseConfig_RelationExtraction,
-                 pretrained_model_name_or_path):
+                 pretrained_model_name_or_path,config: ConfigRelCAT = None):
         super(BaseModel_RelationExtraction, self).__init__(pretrained_model_name_or_path=pretrained_model_name_or_path, 
                                                           relcat_config=relcat_config,
                                                           model_config=model_config)
