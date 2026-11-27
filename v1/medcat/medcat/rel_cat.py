@@ -265,7 +265,7 @@ class RelCAT(PipeRunner):
         test_batch_size = min(test_dataset_size, cfg.train.batch_size)
         test_dataloader = DataLoader(test_rel_data,
                                      batch_size=test_batch_size,
-                                     shuffle=cfg.train.shuffle_data,
+                                     shuffle=False,
                                      num_workers=0,
                                      collate_fn=self.component.padding_seq,
                                      pin_memory=cfg.general.pin_memory)
@@ -329,6 +329,8 @@ class RelCAT(PipeRunner):
 
             loss_per_batch = []
             accuracy_per_batch = []
+            train_true: List[int] = []
+            train_pred: List[int] = []
 
             self.log.info("Currently training epoch %d of %d" % (epoch + 1, n_epochs))
 
@@ -370,6 +372,14 @@ class RelCAT(PipeRunner):
                 loss_per_batch.append(batch_loss.item())
                 accuracy_per_batch.append(batch_acc)
 
+                # collect train predictions for the end-of-epoch report
+                with torch.no_grad():
+                    lbl = labels.view(-1)
+                    keep = lbl != -1
+                    train_true.extend(lbl[keep].cpu().tolist())
+                    train_pred.extend(
+                        classification_logits.view(-1, nclasses).argmax(dim=1)[keep].cpu().tolist())
+
                 # step at the end of each accumulation window, including the last
                 # (possibly partial) window of the epoch
                 if ((i + 1) % gradient_acc_steps == 0) or ((i + 1) == n_batches):
@@ -398,9 +408,17 @@ class RelCAT(PipeRunner):
                 accuracy_per_epoch.append(sum(accuracy_per_batch) / len(accuracy_per_batch))
                 self.log.info("Train accuracy at Epoch %d: %.5f" % (epoch, accuracy_per_epoch[-1]))
 
-            self.log.info("======================== TRAIN SET TEST RESULTS ========================")
-            _ = self.evaluate_results(train_dataloader, self.component.pad_id)
+            # train report from the predictions collected during the loop (no extra pass)
+            if len(train_true) > 0:
+                idx2labels = cfg.general.idx2labels
+                label_ids = sorted(set(train_true) | set(train_pred))
+                target_names = [str(idx2labels.get(i, i)) for i in label_ids]
+                self.log.info("======================== TRAIN SET (running, train mode) ========================")
+                self.log.info("\n" + classification_report(
+                    train_true, train_pred, labels=label_ids,
+                    target_names=target_names, zero_division=0))
 
+            # test set still needs a full eval-mode pass
             self.log.info("======================== TEST SET TEST RESULTS ========================")
             results = self.evaluate_results(test_dataloader, self.component.pad_id)
 
@@ -423,7 +441,6 @@ class RelCAT(PipeRunner):
             save_state(self.component.model, self.component.optimizer, self.component.scheduler,
                        self.epoch, self.best_f1, checkpoint_path,
                        model_name=cfg.general.model_name, task=self.task, is_checkpoint=True)
-
 
     def evaluate_(self, output_logits, labels, ignore_idx):
         """Per-batch metrics via sklearn. Same return signature as before:
@@ -458,7 +475,8 @@ class RelCAT(PipeRunner):
     def evaluate_results(self, data_loader, pad_id):
         self.log.info("Evaluating test samples...")
         if self.component.relcat_config.train.class_weights is not None and self.component.relcat_config.train.enable_class_weights:
-            criterion = nn.CrossEntropyLoss(weight=torch.FloatTensor(self.component.relcat_config.train.class_weights).to(self.device))
+            criterion = nn.CrossEntropyLoss(
+                weight=torch.FloatTensor(self.component.relcat_config.train.class_weights).to(self.device))
         else:
             criterion = nn.CrossEntropyLoss()
 
@@ -522,9 +540,9 @@ class RelCAT(PipeRunner):
         results = {
             "loss": total_loss / max(num_batches, 1),
             "accuracy": accuracy,
-            "precision": macro["precision"],   # macro averages
+            "precision": macro["precision"],  # macro averages
             "recall": macro["recall"],
-            "f1": macro["f1-score"],           # macro F1 drives best-model selection
+            "f1": macro["f1-score"],  # macro F1 drives best-model selection
         }
 
         self.log.info("==================== Evaluation Results ===================")
