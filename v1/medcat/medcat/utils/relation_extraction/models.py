@@ -15,7 +15,7 @@ from medcat.utils.relation_extraction.ml_utils import create_dense_layers, get_a
 class BaseModelBluePrint_RelationExtraction(nn.Module):
     """ Base class for the RelCAT models
     """
-
+    config: ConfigRelCAT
     hf_model: PreTrainedModel
     relcat_config: ConfigRelCAT
     model_config: PretrainedConfig
@@ -24,7 +24,7 @@ class BaseModelBluePrint_RelationExtraction(nn.Module):
     fc2: nn.Linear
     fc3: nn.Linear
 
-    def __init__(self, pretrained_model_name_or_path: str, relcat_config: ConfigRelCAT, model_config: Union[PretrainedConfig, BaseConfig_RelationExtraction]):
+    def __init__(self, pretrained_model_name_or_path: str, relcat_config: ConfigRelCAT, config, model_config: Union[PretrainedConfig, BaseConfig_RelationExtraction]):
         """ Class to hold the HF model + model_config
 
         Args:
@@ -92,7 +92,7 @@ class BaseModel_RelationExtraction(BaseModelBluePrint_RelationExtraction):
     name = "basemodel_relcat"
     log = logging.getLogger(__name__)
 
-    def __init__(self, relcat_config: ConfigRelCAT,
+    def __init__(self, relcat_config: ConfigRelCAT, config: ConfigRelCAT,
                  model_config: BaseConfig_RelationExtraction,
                  pretrained_model_name_or_path):
         super(BaseModel_RelationExtraction, self).__init__(pretrained_model_name_or_path=pretrained_model_name_or_path, 
@@ -100,6 +100,7 @@ class BaseModel_RelationExtraction(BaseModelBluePrint_RelationExtraction):
                                                           model_config=model_config)
 
         self.relcat_config: ConfigRelCAT = relcat_config
+        self.config = relcat_config
         self.model_config: BaseConfig_RelationExtraction = model_config
         self.hf_model: Union[ModernBertModel, BertModel, LlamaModel, PreTrainedModel] = PreTrainedModel(config=model_config.hf_model_config) # type: ignore
         self.pretrained_model_name_or_path: str = pretrained_model_name_or_path
