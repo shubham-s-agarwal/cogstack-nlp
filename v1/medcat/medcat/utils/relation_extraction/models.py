@@ -169,7 +169,7 @@ class BaseModel_RelationExtraction(BaseModelBluePrint_RelationExtraction):
         token_type_ids = token_type_ids.to(self.relcat_config.general.device)  # <-- add this
 
         self.hf_model = self.hf_model.to(self.relcat_config.general.device) # type: ignore
-
+        print("INPUT IDS:",input_ids.shape)
         model_output = self.hf_model(input_ids=input_ids, attention_mask=attention_mask,
                                        token_type_ids=token_type_ids,
                                        encoder_hidden_states=encoder_hidden_states,
