@@ -133,13 +133,18 @@ class BaseModel_RelationExtraction(BaseModelBluePrint_RelationExtraction):
                 input_ids: Optional[torch.Tensor] = None,
                 attention_mask: Optional[torch.Tensor] = None,
                 token_type_ids: Optional[torch.Tensor] = None,
+                labels: Optional[torch.LongTensor] = None,
                 position_ids: Any = None,
                 head_mask: Any = None,
                 encoder_hidden_states: Any = None,
                 encoder_attention_mask: Any = None,
                 Q: Any = None,
                 e1_e2_start: Any = None,
-                pooled_output: Any = None) -> Tuple[torch.Tensor, torch.Tensor]:
+                pooled_output: Any = None,
+                inputs_embeds: Optional[torch.FloatTensor] = None,
+                output_attentions: Optional[bool] = None,
+                output_hidden_states: Optional[bool] = None,
+                return_dict: Optional[bool] = None) -> Tuple[torch.Tensor, torch.Tensor]:
 
         if input_ids is not None:
             input_shape = input_ids.size()
