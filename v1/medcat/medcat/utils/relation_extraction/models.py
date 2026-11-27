@@ -24,7 +24,7 @@ class BaseModelBluePrint_RelationExtraction(nn.Module):
     fc2: nn.Linear
     fc3: nn.Linear
 
-    def __init__(self, pretrained_model_name_or_path: str, relcat_config: ConfigRelCAT, config, model_config: Union[PretrainedConfig, BaseConfig_RelationExtraction]):
+    def __init__(self, pretrained_model_name_or_path: str, relcat_config: ConfigRelCAT, model_config: Union[PretrainedConfig, BaseConfig_RelationExtraction],config: ConfigRelCAT = None):
         """ Class to hold the HF model + model_config
 
         Args:
